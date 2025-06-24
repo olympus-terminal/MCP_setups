@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""
+Simplified MCP Server for Stable Diffusion 2.1
+No PIL dependency - uses pure Python and subprocess calls
+"""
+
+import json
+import sys
+import asyncio
+import subprocess
+import os
+import base64
+from typing import Any, Dict
+
+class SimpleStableDiffusionMCP:
+    def __init__(self):
+        self.output_dir = "generated_glyphs"
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+    def check_diffusers_available(self):
+        """Check if diffusers is available"""
+        try:
+            import diffusers
+            return True
+        except ImportError:
+            return False
+    
+    def generate_glyph_script(self, prompt: str, output_path: str, width: int = 512, height: int = 512):
+        """Generate a Python script to create the glyph"""
+        script = f'''
+import torch
+from diffusers import StableDiffusionPipeline
+import sys
+
+try:
+    # Load model
+    pipe = StableDiffusionPipeline.from_pretrained(
+        "stabilityai/stable-diffusion-2-1",
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        safety_checker=None,
+        requires_safety_checker=False
+    )
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe = pipe.to(device)
+    
+    # Enable optimizations
+    if hasattr(pipe, "enable_attention_slicing"):
+        pipe.enable_attention_slicing()
+    
+    # Enhanced prompt for glyphs
+    enhanced_prompt = "{prompt}, glyph, symbol, icon, black and white, high contrast, simple design, clean lines, minimalist"
+    negative_prompt = "text, letters, words, complex background, realistic photo, blur, noise"
+    
+    # Generate
+    with torch.autocast(device):
+        image = pipe(
+            prompt=enhanced_prompt,
+            negative_prompt=negative_prompt,
+            width={width},
+            height={height},
+            num_inference_steps=20,
+            guidance_scale=7.5,
+            generator=torch.Generator(device=device).manual_seed(42)
+        ).images[0]
+    
+    # Save
+    image.save("{output_path}")
+    print("SUCCESS: Glyph saved to {output_path}")
+    
+except Exception as e:
+    print(f"ERROR: {{e}}")
+    sys.exit(1)
+'''
+        return script
+    
+    def run_generation(self, prompt: str, filename: str) -> tuple[bool, str]:
+        """Run glyph generation"""
+        try:
+            output_path = os.path.join(self.output_dir, f"{filename}.png")
+            script_path = os.path.join(self.output_dir, f"gen_{filename}.py")
+            
+            # Write generation script
+            script_content = self.generate_glyph_script(prompt, output_path)
+            with open(script_path, 'w') as f:
+                f.write(script_content)
+            
+            # Run the script
+            result = subprocess.run([sys.executable, script_path], 
+                                  capture_output=True, text=True, timeout=300)
+            
+            if result.returncode == 0 and "SUCCESS" in result.stdout:
+                # Check if file was created
+                if os.path.exists(output_path):
+                    return True, output_path
+                else:
+                    return False, "File not created"
+            else:
+                return False, f"Generation failed: {result.stderr}"
+                
+        except subprocess.TimeoutExpired:
+            return False, "Generation timed out"
+        except Exception as e:
+            return False, f"Error: {e}"
+    
+    def image_to_base64(self, image_path: str) -> str:
+        """Convert image to base64 without PIL"""
+        try:
+            with open(image_path, 'rb') as f:
+                return base64.b64encode(f.read()).decode('utf-8')
+        except Exception as e:
+            raise Exception(f"Failed to encode image: {e}")
+
+    async def handle_request(self, request: Dict) -> Dict:
+        """Handle MCP requests"""
+        try:
+            method = request.get("method")
+            params = request.get("params", {})
+            
+            if method == "tools/list":
+                return {
+                    "tools": [
+                        {
+                            "name": "generate_microalgae_glyph",
+                            "description": "Generate mystical glyphs and symbols",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "prompt": {
+                                        "type": "string",
+                                        "description": "Description of the glyph (e.g., 'ancient coral symbol', 'thermal vent rune')"
+                                    },
+                                    "glyph_name": {
+                                        "type": "string", 
+                                        "description": "Name for the glyph file (no extension)"
+                                    },
+                                    "style": {
+                                        "type": "string",
+                                        "description": "Style: ancient, mystical, organic, geometric",
+                                        "default": "mystical"
+                                    }
+                                },
+                                "required": ["prompt", "glyph_name"]
+                            }
+                        }
+                    ]
+                }
+            
+            elif method == "tools/call":
+                tool_name = params.get("name")
+                arguments = params.get("arguments", {})
+                
+                if tool_name == "generate_microalgae_glyph":
+                    prompt = arguments.get("prompt")
+                    glyph_name = arguments.get("glyph_name")
+                    style = arguments.get("style", "mystical")
+                    
+                    # Check dependencies
+                    if not self.check_diffusers_available():
+                        return {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Error: diffusers library not available. Install with: pip install diffusers torch transformers"
+                                }
+                            ]
+                        }
+                    
+                    # Enhance prompt with style
+                    full_prompt = f"{style} underwater {prompt}"
+                    
+                    # Generate glyph
+                    success, result = self.run_generation(full_prompt, glyph_name)
+                    
+                    if success:
+                        # Convert to base64
+                        try:
+                            image_b64 = self.image_to_base64(result)
+                            return {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": f"Generated glyph '{glyph_name}' for: {prompt}\\nSaved to: {result}"
+                                    },
+                                    {
+                                        "type": "image",
+                                        "data": image_b64,
+                                        "mimeType": "image/png"
+                                    }
+                                ]
+                            }
+                        except Exception as e:
+                            return {
+                                "content": [
+                                    {
+                                        "type": "text", 
+                                        "text": f"Glyph generated but failed to encode: {e}\\nSaved to: {result}"
+                                    }
+                                ]
+                            }
+                    else:
+                        return {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"Failed to generate glyph: {result}"
+                                }
+                            ]
+                        }
+                
+                else:
+                    raise Exception(f"Unknown tool: {tool_name}")
+            
+            else:
+                raise Exception(f"Unknown method: {method}")
+                
+        except Exception as e:
+            return {
+                "error": {
+                    "code": -1,
+                    "message": str(e)
+                }
+            }
+
+async def main():
+    server = SimpleStableDiffusionMCP()
+    
+    print("Simple Stable Diffusion MCP Server starting...", file=sys.stderr)
+    
+    while True:
+        try:
+            line = input()
+            if not line:
+                break
+                
+            request = json.loads(line)
+            response = await server.handle_request(request)
+            
+            if "id" in request:
+                response["id"] = request["id"]
+            
+            print(json.dumps(response))
+            sys.stdout.flush()
+            
+        except EOFError:
+            break
+        except Exception as e:
+            print(f"Server error: {e}", file=sys.stderr)
+            error_response = {
+                "error": {
+                    "code": -1,
+                    "message": str(e)
+                }
+            }
+            if "request" in locals() and "id" in request:
+                error_response["id"] = request["id"]
+            print(json.dumps(error_response))
+            sys.stdout.flush()
+
+if __name__ == "__main__":
+    asyncio.run(main())
